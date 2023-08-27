@@ -483,4 +483,27 @@ data["codigoPrograma"] = data["CodigoPrograma"]
 # tenemos el id del tomador
 data = data.drop("CodigoPrograma", "tomador", axis=1)
 data = data.set_index("codigoPrograma")
+# Hay valor de cuota con simbolo negativo
+data = data[(data["valorUltimaCuota"] > 0) &
+            (data["valorUltimaCuota"] < 1200000)]
+# Existen más de 1 esposa y más de una madre
+data = data[(data["madre"] < 2) & (data["esposa"] < 2) & (data["esposo"] < 2)]
+# Reducir variables categoricas
+variables_categoricas = ["qPersonas", "qMascotas",
+                         "localidad", "inactivoadmin", "inactivocosto", "inactivofallecimiento",
+                         "inactivoinactivo", "inactivoincumplimiento", "inactivoinfluencia", "inactivomala", "inactivorecuperado",
+                         "inactivoubicacion", "inactivovoluntario", "sentimiento", "nombrePlan", "profesionTomador", "agricultor",
+                         "comerciante", "docente", "empleado", "estudiante", "hogar", 'independiente', 'oficiosVarios', 'pensionado', 'esposa', 'esposo',
+                         'hermana', 'hermano', 'hija', 'hijo', 'madre']
+# Definir umbral de baja frecuencia 1%
+umbral = data.shape[0]*0.01
+for variable_a_evaluar in variables_categoricas:
+    data[variable_a_evaluar] = data[variable_a_evaluar].astype(str)
+    frecuencia = data[variable_a_evaluar].value_counts()
+    # Identificar categorías con baja frecuencia
+    categorias_baja_frecuencia = frecuencia[frecuencia < umbral].index
+    # Reemplazar categorías con baja frecuencia por un valor único
+    data[variable_a_evaluar].loc[data[variable_a_evaluar].isin(
+        categorias_baja_frecuencia)] = 'Otros'
+
 data.to_csv("../data/outputs/desercion_version_1.csv")
