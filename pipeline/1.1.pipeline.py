@@ -1,37 +1,33 @@
-
 """
 -*- coding: utf-8 -*-
-Creado 21 Agosto 2023
+Creado 03 Septiembre 2023
 @author: Carlos Luis Mora Cañas - Carlos Felipe Cortés Cataño
 """
 # Importar librerias
-# Manipulación datos
-from textblob import TextBlob  # Traductor ingles para mayor precisión
-# Analisis de sentimiento
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from nltk.corpus import stopwords
-import string  # Operaciones de cadenas de caracteres
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import datetime as dt
-
-# Tratamiento texto
+import warnings
 import re
-import nltk  # Procesamiento del lenguaje natural
-nltk.download('averaged_perceptron_tagger')  # tagger
-nltk.download('vader_lexicon')  # Lexicon
-nltk.download('wordnet')  # Categorizacion de las palabras
-nltk.download('stopwords')  # Quitar palabras comunes
-# pip uninstall vaderSentiment
-# pip install vader-multi
+from sklearn.utils import resample
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import recall_score, f1_score, roc_auc_score
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import string  # Operaciones de cadenas de caracteres
+from nltk.corpus import stopwords
+import nltk
+nltk.download('stopwords')
+warnings.filterwarnings("ignore")
+# Manipulación datos
 
 # parametros
 umbral_reduccion_partesco = 0.03  # percentil 3
 umbral_reduccion_profesiones = 0.01  # percentil 1
 umbral_reduccion_gestion = 0.01  # percentil 1
 dias_analisis_observaciones = 300  # Análsis texto ultimos días
-
+# Modelo
 # funciones
 # Función para interpretar el sentimiento
 
@@ -82,29 +78,29 @@ reporte = pd.read_excel(
     "../data/Consulta_promotora_082023.ods", engine="odf").sort_values("fechaSolicitud").drop_duplicates(
     subset=["CodigoPrograma", "EstadoActual"], keep="first")
 # Creamos copia, eliminamos los registros que en la importación crean una nueva columna, o tiene errores y la columna
+
 data = reporte.copy().drop(reporte[reporte["Unnamed: 21"].notna()].index).drop(
     ["Unnamed: 21"], axis=1)
-data = data.drop(data[~data["EstadoActual"].str.contains("-")].index)
-# Damos uniformidad a los tipos de valores
 data["idTomador"] = data["Documento_cliente"].replace(
     ["", "C", "M"], np.nan, regex=True)
 data["valorCuota1"] = data["valorCuota_1"].replace(
     ["", "factura"], np.nan, regex=True).astype(float)
+# Damos uniformidad a los tipos de valores y nombres de variables
+# Definimos dia de pago
 data["diaPagoCuota"] = data["fechaIdealPago_CuotaCancelada"].astype(str).str.split(
     "-", expand=True)[2].str.split(" ", expand=True)[0].fillna(np.nan).astype(float)
-# Se cambiaron los nombres y se elimina fecha de Nacimiento porque es redundante con edad
+# Eliminamos variables no aplicables al modelo
 data = data.drop(["fechaIdealPago_CuotaCancelada",
-                 "Documento_cliente", "valorCuota_1", "fechaNacimiento"], axis=1)
-
+                 "Documento_cliente", "fechaNacimiento", "valorCuota_1", "coordenadas"], axis=1)
 # Elimina registros vacios en tipo de programa necesario según reglas de negocio
 data = data.drop(data[data["TipoPrograma"].isna()].index)
-
+# Elimina registros con casilla corrida
+data = data[data["FechaRescindido"].str.isspace().isna()]
 # Elimina todos aquellos que sean empresariales, no hacen parte del estudio, solo familiares
 data = data[data["TipoPrograma"] != "Empresarial"]
 data = data.drop("TipoPrograma", axis=1)
-
 # Imputamos valores del valor de la cuota, dependiendo de las medias de la cuota de inscritos y de mascotas
-temp = data.groupby(["#_inscritos_activos", "#_mascotas_activas"]).mean()[
+temp = data[["#_inscritos_activos", "#_mascotas_activas", "valorCuota1", "valorUltimaCuota"]].groupby(["#_inscritos_activos", "#_mascotas_activas"]).mean()[
     ["valorCuota1", "valorUltimaCuota"]].reset_index()
 temp = data[data["valorCuota1"].isna()].drop(
     ["valorCuota1", "valorUltimaCuota"], axis=1).merge(temp, on=["#_inscritos_activos", "#_mascotas_activas"])
@@ -113,96 +109,7 @@ data = pd.concat([data, temp], axis=0)
 data = data.reset_index().drop("index", axis=1)
 data = data.rename(columns={'#_inscritos_activos': "qPersonas",
                             '#_mascotas_activas': "qMascotas"})
-# División del diccionario longitud y latitud en 2 atributos
-temp = data[["CodigoPrograma", "coordenadas"]].dropna()
-temp = temp.set_index("CodigoPrograma")
-temp["coordenadas"] = temp["coordenadas"].apply(
-    lambda indice: indice.split(',"pov":')[0])
-temp["coordenadas"] = temp["coordenadas"].apply(
-    lambda indice: indice.replace('{"pos":{"latitud":', "").
-    replace("}", "").replace('"longitud":', ""))
-temp = temp["coordenadas"].str.split(",", expand=True).rename(
-    columns={0: "latitud", 1: "longitud"}).reset_index()
-data = data.merge(temp, on="CodigoPrograma",
-                  how="left").drop("coordenadas", axis=1)
-
-# Estados
-# Existen estados que son casos especiales, no hacen parte del estudio
-estados_especiales = ["Activo - Pendiente de autorización",
-                      "Activo - Programa con inconsistencia", "Activo - Activo para verificación",
-                      "Inactivo - Venta no efectiva", "Inactivo - Pendiente primer pago",
-                      "Inactivo - Pendiente de autorización", 'Inactivo - Programa con inconsistencia severa',
-                      "Inactivo - Programa con inconsistencia severa", "Inactivo - Alianza Olivos Promollano 2021"
-                      'Inactivo - Programa pendiente de activación por empresa', "Inactivo - Desvinculación de la empresa",
-                      "Inactivo - Trámites para realizar contrato", "Inactivo - Programa cedido a Santa Rosa o Alto de occidente",
-                      "Inactivo - Cambio de forma de pago (Alto Occidente_Santa _Rosa)", "Inactivo - Alianza Olivos Promollano 2021",
-                      "Inactivo - Equipos", "Inactivo - Plenitud 50 pendiente por definir", "Activo - Programa pendiente de activación por empresa",
-                      "Inactivo - Cancelado Propietario CHEC"
-                      ]
-
-data = data.drop(data[data["EstadoActual"].astype(
-    str).isin(estados_especiales)].index)
-# Definición y validación estados del programa
-estados = pd.DataFrame(columns=["CodigoPrograma", "estado", "fecha"])
-# Primer inactivo - Fecha de rescindido
-temp = data[["CodigoPrograma", "FechaRescindido", "EstadoActual"]].rename(
-    columns={"FechaRescindido": "fecha", "EstadoActual": "estado"})
-temp = temp.drop(temp[temp["fecha"].isna()].index)
-estados = pd.concat([estados, temp])
-# Estados contenidos en el atributo Estados
-temp = data[["CodigoPrograma", "Estados"]].dropna()
-temp["Estados"] = temp["Estados"].str.replace(
-    "[", "", regex=True).str.replace("]", "", regex=True)
-temp = temp.set_index("CodigoPrograma")
-temp = temp["Estados"].str.split("},", expand=True).stack(
-).reset_index().drop("level_1", axis=1).set_index("CodigoPrograma")
-temp = temp[0].str.split(",", expand=True)
-temp[1] = temp[2].where(~temp[2].isna(), temp[1])
-temp = temp.reset_index().rename(columns={0: "estado",
-                                          1: "fecha"}).drop(2, axis=1)
-temp["estado"] = temp["estado"].str.replace(
-    '{"Estado":"', "", regex=True).str.replace('"', "", regex=True)
-temp["fecha"] = temp["fecha"].str.replace(
-    '"fechainicio":"', "", regex=True).str.replace(
-    '"fechacancelacion":"', "", regex=True).str.replace('"}', "",
-                                                        regex=True).str.replace('"', "", regex=True).str.replace('T', " ", regex=True)
-estados = pd.concat([estados, temp])
-# Eliminamos nuevamente estados que son especiales pero esta vez de nuestro nuevo dataframe
-estados = estados.drop(estados[estados["estado"].astype(
-    str).isin(estados_especiales)].index)
-# Eliminamos estados duplicados por fecha y estado
-estados = estados.drop_duplicates(subset=["CodigoPrograma", "estado"])
-# Agrupación motivos
-estados = pd.concat([estados.drop("estado", axis=1),
-                     estados["estado"].str.split("-", expand=True, n=1)
-                     .rename(columns={0: "estado", 1: "motivo"})], axis=1)
-remplazo_motivos = {
-    "Percepción negativa de la empresa por comentarios de un tercero": "Influencia de seres cercanos",
-    "Cambio de programa- inscritos pasan a plan nuevo Aurora": "Admin", "Terminación y uso del contrato": "Admin",
-    "Cambio de lugar de vivienda": "Ubicación", "Dificultad para ubicarlo": "Ubicación",
-    "Se retira por 50% del servicio por atraso": "Incumplimiento", "Sala de velación": "Mala",
-    "Reportado por la CHEC": "Incumplimiento", "Cliente de Alto Riesgo": "Incumplimiento",
-    "Cobertura del servicio": "Mala", "Cobros indebidos": "Mala", "Inconformidad en el recaudo": "Mala",
-    "Precio del plan": "Costo", "PENDIENTE DEFINIR RETIRO": "Inactivo", "No Interesado": "Voluntario",
-    "Problemas económicos": "Voluntario", "Pago extendido y no uso del servicio": "Voluntario",
-    "Programa pendiente de activación por empresa": "Inactivo", "Mejoramiento del estilo de vida": "Influencia", "Doblemente afiliado en la aurora": "Admin",
-    "Parque cementerio": "Mala", "Parque crematorio": "Mala", "Experimentación": "Admin"}
-
-estados = estados.replace(remplazo_motivos, regex=True)
-estados["motivo"] = estados["motivo"].str.split(" ", expand=True)[1]
-estados["concat"] = estados["estado"].str.cat(
-    estados["motivo"], "- ").apply(limpiar_texto).replace(" ", "", regex=True)
-# Los estados activos no aportan a la medición
-estados = estados.drop(estados[(estados["concat"] == "activoactivo")].index)
-# Añadiendo los conteos al dataframe principal
-temp = estados.groupby(["CodigoPrograma", "concat"]).count()[
-    "fecha"].reset_index()
-temp = pd.pivot(temp, index=["CodigoPrograma"], columns=['concat'])[
-    "fecha"].reset_index().fillna(0)
-data = data.merge(temp, how="left", on="CodigoPrograma")
-data[temp.columns] = data[temp.columns].fillna(0)
-
-# La fecha de rescindido la usamos para obtener la duración del programa
+# Calculamos duración del programa
 # Si hay fecha de rescidindo usamos esa fecha sino hay valor nulo usamos la ultima fecha reportada en creación en estado
 ultima_fecha_solicitud = pd.to_datetime(reporte["fechaSolicitud"].dropna(
 ).sort_values().tail(1).values[0])
@@ -212,7 +119,7 @@ data["FechaRescindido"] = data["FechaRescindido"].fillna(
 data["duracion"] = data["FechaRescindido"] - data["fechaSolicitud"]
 data["duracion"] = data["duracion"].dt.days
 # Existen 5 casos con valores negativos esto no debe ocurrir se igualan al promedio según cantidad mascotas y personas
-temp = data.groupby(["qPersonas", "qMascotas"]).mean()[
+temp = data[["qPersonas", "qMascotas", "duracion"]].groupby(["qPersonas", "qMascotas"]).mean()[
     "duracion"].reset_index()
 data = data.merge(temp, on=["qPersonas", "qMascotas"])
 data["duracion"] = data["duracion_x"].where(
@@ -226,7 +133,8 @@ data = data.drop(["fechaSolicitud", "FechaRescindido",
 # Conteo facturas generadas y promedio de descuentos otorgados
 temp = data[["CodigoPrograma", "Cuotas"]].dropna()
 temp["Cuotas"] = temp["Cuotas"].str.replace(
-    "[", "", regex=True).str.replace("]", "", regex=True)
+    '\[', "", regex=True)
+temp["Cuotas"] = temp["Cuotas"].str.replace('\]', "", regex=True)
 temp = temp.set_index("CodigoPrograma")
 temp = temp["Cuotas"].str.split("},", expand=True).stack(
 ).reset_index().drop("level_1", axis=1).set_index("CodigoPrograma")
@@ -258,10 +166,9 @@ temp["periodoCuota"] = temp["periodoCuota"].str.replace(
 cuota = temp["cuota"].str.replace("Contrato# ", "").str.replace("Cuota# ", "")\
     .str.split("-", expand=True).rename(columns={0: "contrato", 1: "cuota"})
 cuotas = pd.concat([temp.drop("cuota", axis=1), cuota], axis=1)
-
 temp = cuotas["periodoCuota"].str.replace(
-    "\\", "", regex=True).str.replace(
-    "}", "", regex=True).str.split("-", expand=True)\
+    '\\\\', "", regex=True).str.replace(
+    "\}", "", regex=True).str.split("-", expand=True)\
     .rename(columns={0: "periodoInicial", 1: "periodoFinal"})
 temp["periodoInicial"] = temp["periodoInicial"].apply(
     lambda x: datetime.strptime(x, "%d/%m/%Y"))
@@ -285,34 +192,10 @@ data["qDescOtorgado"] = data["qDescOtorgado"].fillna(0)
 data["cambioCuota"] = data["valorUltimaCuota"] - data["valorCuota1"]
 # Eliminamos variables redundantes
 data = data.drop(["Cuotas", "valorCuota1"], axis=1)
-
-
-# Análisis de texto con observaciones
-temp = data[["CodigoPrograma", "Observaciones"]].dropna()
-temp["Observaciones"] = temp["Observaciones"].str.replace(
-    "[", "", regex=True).str.replace("]", "", regex=True)
-temp = temp.set_index("CodigoPrograma")
-temp = temp["Observaciones"].str.split("},", expand=True).stack(
-).reset_index().drop("level_1", axis=1).set_index("CodigoPrograma")
-temp = temp[0].str.split(",", expand=True, n=2)
-temp = temp.reset_index().rename(columns={0: "fecha",
-                                          1: "empleado", 2: "observacion",
-                                          })
-temp["fecha"] = temp["fecha"].str.replace(
-    '{"fechaIngreso":"', "", regex=True).str.replace('"', "", regex=True)\
-    .str.replace('\\', "", regex=True).str.replace(' ', "", regex=True)
-temp["fecha"] = temp["fecha"].apply(lambda x: datetime.strptime(x, "%d/%m/%Y"))
-temp["empleado"] = temp["empleado"].str.replace(
-    '"empleado":"', "", regex=True).str.replace('"', "", regex=True)
-temp["observacion"] = temp["observacion"].str.replace(
-    '"observacion":"', "", regex=True).str.replace('"', "", regex=True)
-# Descartamos observaciones ultimo año posteriores a la ultima solicitud y los atributos empleado-fecha
-observaciones = temp[temp["fecha"] > ultima_fecha_solicitud -
-                     dt.timedelta(dias_analisis_observaciones)][["CodigoPrograma", "observacion"]]
 # Gestiones de recaudo
 temp = data[["CodigoPrograma", "GestionesRecaudo"]].dropna()
 temp["GestionesRecaudo"] = temp["GestionesRecaudo"].str.replace(
-    "[", "", regex=True).str.replace("]", "", regex=True)
+    "\[", "", regex=True).str.replace("\]", "", regex=True)
 temp = temp.set_index("CodigoPrograma")
 temp = temp["GestionesRecaudo"].str.split("},", expand=True).stack(
 ).reset_index().drop("level_1", axis=1).set_index("CodigoPrograma")
@@ -375,39 +258,12 @@ debido a que la fecha del envio no se reporta correctamente, se recomienda corre
 para calcular correctamente los días en que se realiza la gestión,
 así mismo se evidencia que el atributo mensaje solo contiene 5 mensajes en una serie de recaudos
 se recomienda dejar comentarios o mensajes para hacer análisis de texto también a este atributo"""
-# Para futuro análisis de texto, se concatena con observaciones
-recaudos = recaudos[["CodigoPrograma", "mensaje"]]
-# Análisis de textos en observaciones
-observaciones["observacion"] = observaciones["observacion"].apply(
-    limpiar_texto)
-# Falla constantemente la API para traducir los textos
-analizador = SentimentIntensityAnalyzer()
-temp = observaciones["observacion"].apply(
-    lambda x: analizador.polarity_scores(x))
-resultado = pd.concat([observaciones, temp.apply(pd.Series)], axis=1)
-
-# Agrupar por nb_words y realizar operaciones de suma y promedio en las columnas neg, neu, pos, compound
-temp = resultado.groupby("CodigoPrograma").agg({"neg": ["sum", "mean"], "neu": [
-    "sum", "mean"], "pos": ["sum", "mean"], "compound": ["sum", "mean"]})
-# Resetear el índice del DataFrame
-temp = temp.reset_index()
-temp.columns = generate_column_names(temp.columns)
-
-# Aplicar la función al DataFrame y crear una nueva columna "sentimiento"
-temp["sentimiento"] = temp.apply(
-    interpretar_sentimiento, axis=1)
-temp["CodigoPrograma"] = temp["_CodigoPrograma"]
-data = data.merge(temp[["CodigoPrograma", "sentimiento"]],
-                  how="left", on="CodigoPrograma")
-data["sentimiento"] = data["sentimiento"].fillna(0)
-
 """El nivel socioeconomico, variable significativa, se extrae de la latitud y longitud, sin embargo,
 más del 75% de los datos no presentan estos datos, para complementarlos
 se puede usar la dirección y la localidad de la venta pero se debe pagar
 por el servicio ArcGis o uno similar, este presupuesto esta fuera del alcance del proyecto,
 y no obtamos por perder esa cantidad de datos, se procede a eliminar las variables, solo usaremos la localidad"""
-data = data.drop(["Direccion", "longitud", "latitud"], axis=1).rename(
-    columns={"LocalidadVenta": "localidad"})
+data = data.drop("Direccion", axis=1)
 # Añade datos titulares
 datos_titulares = pd.read_excel(
     "../data/base_datos_titulares_e_inscritos.xlsx")
@@ -472,7 +328,6 @@ temp = pd.pivot(temp, index=["NOMBRE_TOMADOR"], columns=['PARENTESCO'])[
                      })  # otros es categoría que generaliza
 data = data.merge(temp, on="tomador", how="left")
 data[temp.columns] = data[temp.columns].fillna(0)
-data["localidad"] = data["localidad"].apply(limpiar_texto)
 data["profesion_tomador"] = data["profesion_tomador"].apply(
     limpiar_texto).replace(" ", "", regex=True).replace("identificada", "noIdentificado", regex=True).replace("", "noIdentificada")
 data["nom_plan"] = data["nom_plan"].apply(
@@ -481,7 +336,9 @@ data = data.rename(columns={"oficios varios": "oficiosVarios", "profesion_tomado
                             "nom_plan": "nombrePlan", "prom_edad_insc": "promedioEdadInscritos"})
 data["codigoPrograma"] = data["CodigoPrograma"]
 # tenemos el id del tomador
-data = data.drop("CodigoPrograma", "tomador", axis=1)
+data = data.drop("CodigoPrograma", axis=1).rename(
+    columns={"LocalidadVenta": "localidad"})
+data["localidad"] = data["localidad"].apply(limpiar_texto)
 data = data.set_index("codigoPrograma")
 # Hay valor de cuota con simbolo negativo
 data = data[(data["valorUltimaCuota"] > 0) &
@@ -489,11 +346,9 @@ data = data[(data["valorUltimaCuota"] > 0) &
 # Existen más de 1 esposa y más de una madre
 data = data[(data["madre"] < 2) & (data["esposa"] < 2) & (data["esposo"] < 2)]
 # Reducir variables categoricas
-variables_categoricas = ["qPersonas", "qMascotas",
-                         "localidad", "inactivoadmin", "inactivocosto", "inactivofallecimiento",
-                         "inactivoinactivo", "inactivoincumplimiento", "inactivoinfluencia", "inactivomala", "inactivorecuperado",
-                         "inactivoubicacion", "inactivovoluntario", "sentimiento", "nombrePlan", "profesionTomador", "agricultor",
-                         "comerciante", "docente", "empleado", "estudiante", "hogar", 'independiente', 'oficiosVarios', 'pensionado', 'esposa', 'esposo',
+variables_categoricas = ["qPersonas", "qMascotas", "nombrePlan", "agricultor",
+                         "comerciante", "docente", "empleado", "estudiante", "localidad",
+                         "hogar", 'independiente', 'oficiosVarios', 'pensionado', 'esposa', 'esposo',
                          'hermana', 'hermano', 'hija', 'hijo', 'madre']
 # Definir umbral de baja frecuencia 1%
 umbral = data.shape[0]*0.01
@@ -505,5 +360,110 @@ for variable_a_evaluar in variables_categoricas:
     # Reemplazar categorías con baja frecuencia por un valor único
     data[variable_a_evaluar].loc[data[variable_a_evaluar].isin(
         categorias_baja_frecuencia)] = 'Otros'
+data = data.reset_index()
+# Modelado con reentrenamiento
 
-data.to_csv("../data/outputs/desercion_version_1.csv")
+variables_modelo = ['qPersonas', 'qMascotas', 'localidad', 'nombrePlan', 'agricultor',
+                    'comerciante', 'docente', 'empleado', 'estudiante', 'hogar',
+                    'independiente', 'oficiosVarios', 'pensionado', 'esposa', 'esposo',
+                    'hermana', 'hermano', 'hija', 'hijo', 'madre', 'edad', 'diaPagoCuota',
+                    'duracion', 'promPercDesc', 'gestionExitosa', 'gestionNoEjecutada',
+                    'promedioEdadInscritos', 'estado']
+data_model = data.copy()[variables_modelo]
+variables_categoricas = ["qPersonas", "qMascotas",
+                         "localidad", "inactivoadmin", "inactivocosto", "inactivofallecimiento",
+                         "inactivoinactivo", "inactivoincumplimiento", "inactivoinfluencia", "inactivomala", "inactivorecuperado",
+                         "inactivoubicacion", "inactivovoluntario", "sentimiento", "nombrePlan", "profesionTomador", "agricultor",
+                         "comerciante", "docente", "empleado", "estudiante", "hogar", 'independiente', 'oficiosVarios', 'pensionado', 'esposa', 'esposo',
+                         'hermana', 'hermano', 'hija', 'hijo', 'madre']
+
+# Hot encoder para variables categoricas
+labelencoder = LabelEncoder()
+for column in variables_categoricas:
+    try:
+        data_model[column] = data_model[column].astype(str)
+        data_model[column] = labelencoder.fit_transform(data_model[column])
+    except:
+        pass
+
+# Encoder personalizado para estado 1 es inactivo
+data_model["estado"] = data_model["estado"].replace(
+    "Inactivo ", 1).replace("Activo ", 0)
+# Balanceo
+
+
+def random_undersample(X, y, majority_class):
+    # Separa las instancias de la clase mayoritaria y minoritaria
+    majority_X = X[y == majority_class]
+    minority_X = X[y != majority_class]
+    minority_y = y[y != majority_class]
+
+    # Realiza undersampling aleatorio en la clase mayoritaria
+    majority_X_undersampled = resample(majority_X,
+                                       replace=False,  # No reemplazar las instancias
+                                       # Igual número de instancias que la clase minoritaria
+                                       n_samples=len(minority_y),
+                                       random_state=42)  # Fijar una semilla para reproducibilidad
+
+    # Combina las instancias undersampled de la clase mayoritaria con la clase minoritaria
+    X_undersampled = np.concatenate([majority_X_undersampled, minority_X])
+    y_undersampled = np.concatenate(
+        [np.repeat(majority_class, len(minority_y)), minority_y])
+
+    return X_undersampled, y_undersampled
+
+
+X_undersampled, y_undersampled = random_undersample(
+    data_model.drop("estado", axis=1), data_model["estado"], 0)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_undersampled, y_undersampled, test_size=0.30, random_state=100)
+# Escalar para facilitar calculos
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+# Modelado
+xgb_model = xgb.XGBClassifier(colsample_bytree=0.9,
+                              learning_rate=0.1,
+                              max_depth=7, n_estimators=300,
+                              subsample=0.8)
+xgb_model.fit(X_train, y_train)
+# Realizar predicciones en el conjunto de prueba
+predictions = xgb_model.predict(X_test)
+# Evaluar
+unique, counts = np.unique(
+    labelencoder.inverse_transform(predictions), return_counts=True)
+predictions_df = pd.DataFrame(
+    counts, ["Activo", "Inactivo"]).rename(columns={0: "conteo"})
+total = sum(counts)
+predictions_df["porcentaje"] = round(predictions_df["conteo"] / total*100)
+print("Metricas modelo XGB para identificar desertores")
+print(predictions_df)
+recall = recall_score(y_test, predictions, average='weighted')
+f1 = f1_score(y_test, predictions, average='weighted')
+auc_roc = roc_auc_score(y_test, predictions,
+                        average='weighted', multi_class='ovr')
+print("Recall:", round(recall, 2))
+print("F1-Score:", round(f1, 2))
+print("AUC-ROC:", round(auc_roc, 2))
+programas_activos = data_model[data_model["estado"] == 0]
+descertores = xgb_model.predict(
+    programas_activos.drop("estado", axis=1))
+data_results = data[data["estado"] == "Activo "]
+data_results["results"] = descertores
+print("Los programas propensos a desertar son:")
+codigodescertores = data_results[(data_results["estado"] == "Activo ") & (
+    data_results["results"] == 1)]
+print(codigodescertores["codigoPrograma"].values)
+# Especifica la ruta y el nombre del archivo
+# Obtener la fecha y hora actual
+fecha_actual = datetime.now().date()
+ruta_archivo = f'../data/outputs/desertores{fecha_actual}.txt'
+ruta_excel = f'../data/outputs/desertores{fecha_actual}.csv'
+# Abre el archivo en modo escritura
+recall = round(recall, 2)*100
+with open(ruta_archivo, "w") as archivo:
+    archivo.write(
+        f'Los programas propensos a desertar son {codigodescertores["codigoPrograma"].values} con una tasa de {recall}')
+
+print("Texto exportado correctamente al archivo:", ruta_archivo)
+codigodescertores.to_csv(ruta_excel, index=False)
